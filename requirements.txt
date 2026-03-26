@@ -1,0 +1,9 @@
+python-telegram-bot==21.6
+noisereduce==3.0.3
+librosa==0.10.2
+soundfile==0.12.1
+numpy==1.26.4
+scipy==1.13.1
+# AI method (optional but recommended):
+demucs==4.0.1
+torch==2.3.1
