@@ -1,8 +1,12 @@
 import os
+import re
 import logging
 import tempfile
 import asyncio
 from pathlib import Path
+
+import gdown
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,21 +27,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-# Webhook settings — set these in Render's environment variables
-# WEBHOOK_URL  : your full Render URL e.g. https://your-bot.onrender.com
-# PORT         : Render sets this automatically (default 8443)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT") or 8443)
+
+TELEGRAM_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 
 # Store pending audio files per user: user_id -> temp_file_path
 pending_audio: dict[int, str] = {}
 
 
+# ── Google Drive helpers ─────────────────────────────────────────────────────
+
+GDRIVE_PATTERNS = [
+    r"https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)",
+    r"https://drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)",
+    r"https://drive\.google\.com/uc\?id=([a-zA-Z0-9_-]+)",
+]
+
+def extract_gdrive_id(text: str) -> str | None:
+    for pattern in GDRIVE_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+def download_from_gdrive(file_id: str, dest_path: str) -> None:
+    url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(url, dest_path, quiet=False, fuzzy=True)
+
+
+# ── Shared: ask method ───────────────────────────────────────────────────────
+
+async def ask_method(message, user_id: int, file_path: str) -> None:
+    pending_audio[user_id] = file_path
+    keyboard = [[
+        InlineKeyboardButton("⚡ Fast (noisereduce)", callback_data="method_fast"),
+        InlineKeyboardButton("🧠 AI High Quality", callback_data="method_ai"),
+    ]]
+    await message.reply_text(
+        "✅ Audio received! Choose your cleaning method:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ── Handlers ─────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎙️ *Audio Cleaner Bot*\n\n"
-        "Send me a voice message or audio file and I'll remove background noise for you.\n\n"
+        "Send me a voice message or audio file (under 20MB) and I'll remove background noise.\n\n"
+        "For files *over 20MB*, share a Google Drive link (set to 'Anyone with the link').\n\n"
         "Commands:\n"
         "/start – Show this message\n"
         "/help – How to use the bot",
@@ -48,55 +87,94 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *How to use:*\n\n"
-        "1. Send a voice message or audio file\n"
-        "2. Choose your cleaning method:\n"
-        "   • *Fast* – Quick spectral noise reduction\n"
-        "   • *AI (High Quality)* – Deep learning model, slower but better\n"
-        "3. Receive your cleaned audio!\n\n"
+        "*Small files (under 20MB):*\n"
+        "Just send the audio file or voice message directly.\n\n"
+        "*Large files (over 20MB):*\n"
+        "1. Upload to Google Drive\n"
+        "2. Right-click → Share → 'Anyone with the link'\n"
+        "3. Paste the link here\n\n"
+        "*Then choose your cleaning method:*\n"
+        "• ⚡ *Fast* – Quick spectral noise reduction\n"
+        "• 🧠 *AI High Quality* – Deep learning, slower but better\n\n"
         "Supported formats: OGG, MP3, WAV, M4A, FLAC",
         parse_mode="Markdown",
     )
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle direct audio/voice file uploads (Telegram limit: 20MB)."""
     user_id = update.effective_user.id
     message = update.message
 
-    # Get the file object (voice or audio)
     file_obj = message.voice or message.audio
     if not file_obj:
         await message.reply_text("❌ Please send a voice message or audio file.")
         return
 
+    # Check file size before attempting download
+    file_size = getattr(file_obj, "file_size", 0) or 0
+    if file_size > TELEGRAM_MAX_BYTES:
+        await message.reply_text(
+            f"⚠️ Your file is *{file_size / 1024 / 1024:.1f}MB* which exceeds Telegram's 20MB bot limit.\n\n"
+            "Please upload it to *Google Drive*, set sharing to 'Anyone with the link', and paste the link here.",
+            parse_mode="Markdown",
+        )
+        return
+
     await message.reply_text("⏳ Downloading your audio...")
 
     try:
-        # Download the file
         tg_file = await context.bot.get_file(file_obj.file_id)
         suffix = ".ogg" if message.voice else Path(file_obj.file_name or "audio.mp3").suffix
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         await tg_file.download_to_drive(tmp.name)
         tmp.close()
-
-        # Store for later processing
-        pending_audio[user_id] = tmp.name
-
-        # Ask for method
-        keyboard = [
-            [
-                InlineKeyboardButton("⚡ Fast (noisereduce)", callback_data="method_fast"),
-                InlineKeyboardButton("🧠 AI High Quality", callback_data="method_ai"),
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await message.reply_text(
-            "✅ Audio received! Choose your cleaning method:",
-            reply_markup=reply_markup,
-        )
+        await ask_method(message, user_id, tmp.name)
 
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        await message.reply_text("❌ Failed to download audio. Please try again.")
+        logger.error(f"Download error: {e}", exc_info=True)
+        await message.reply_text(f"❌ Failed to download audio. Error: `{e}`", parse_mode="Markdown")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Google Drive links sent as text messages."""
+    user_id = update.effective_user.id
+    message = update.message
+    text = message.text or ""
+
+    file_id = extract_gdrive_id(text)
+    if not file_id:
+        await message.reply_text(
+            "💬 I only accept audio files or Google Drive links.\n"
+            "Send /help for instructions."
+        )
+        return
+
+    await message.reply_text("⏳ Downloading from Google Drive... This may take a moment.")
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".audio")
+        tmp.close()
+
+        await asyncio.get_event_loop().run_in_executor(
+            None, download_from_gdrive, file_id, tmp.name
+        )
+
+        if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) == 0:
+            await message.reply_text("❌ Download failed. Make sure the file is shared as 'Anyone with the link'.")
+            return
+
+        size_mb = os.path.getsize(tmp.name) / 1024 / 1024
+        await message.reply_text(f"✅ Downloaded ({size_mb:.1f}MB). Now choose your cleaning method:")
+        await ask_method(message, user_id, tmp.name)
+
+    except Exception as e:
+        logger.error(f"Google Drive download error: {e}", exc_info=True)
+        await message.reply_text(
+            "❌ Failed to download from Google Drive.\n"
+            "Make sure sharing is set to *'Anyone with the link'*.",
+            parse_mode="Markdown",
+        )
 
 
 async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -104,7 +182,7 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     user_id = query.from_user.id
-    method = query.data  # "method_fast" or "method_ai"
+    method = query.data
 
     input_path = pending_audio.get(user_id)
     if not input_path or not os.path.exists(input_path):
@@ -112,11 +190,14 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     method_label = "⚡ Fast" if method == "method_fast" else "🧠 AI High Quality"
-    await query.edit_message_text(f"🔄 Processing with *{method_label}* method... Please wait.", parse_mode="Markdown")
+    await query.edit_message_text(
+        f"🔄 Processing with *{method_label}* method... Please wait.",
+        parse_mode="Markdown",
+    )
+
+    output_path = tempfile.mktemp(suffix="_cleaned.wav")
 
     try:
-        output_path = tempfile.mktemp(suffix="_cleaned.wav")
-
         if method == "method_fast":
             await asyncio.get_event_loop().run_in_executor(
                 None, clean_audio_simple, input_path, output_path
@@ -126,7 +207,6 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
                 None, clean_audio_ai, input_path, output_path
             )
 
-        # Send back cleaned audio
         with open(output_path, "rb") as f:
             await context.bot.send_audio(
                 chat_id=query.message.chat_id,
@@ -136,15 +216,17 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown",
             )
 
-        await query.edit_message_text(f"✅ Cleaned with *{method_label}* — audio sent above!", parse_mode="Markdown")
+        await query.edit_message_text(
+            f"✅ Cleaned with *{method_label}* — audio sent above!",
+            parse_mode="Markdown",
+        )
 
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        await query.edit_message_text("❌ Processing failed. Please try again.")
+        logger.error(f"Processing error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Processing failed. Error: `{e}`", parse_mode="Markdown")
 
     finally:
-        # Cleanup temp files
-        for path in [input_path, output_path if 'output_path' in locals() else None]:
+        for path in [input_path, output_path]:
             if path and os.path.exists(path):
                 try:
                     os.remove(path)
@@ -152,6 +234,8 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
                     pass
         pending_audio.pop(user_id, None)
 
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -162,22 +246,20 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_method_choice, pattern="^method_"))
 
     if WEBHOOK_URL:
-        # ── Production (Render) ──────────────────────────────────────────
-        # Telegram will POST updates to: https://your-bot.onrender.com/<token>
         logger.info(f"Starting webhook on port {PORT} → {WEBHOOK_URL}")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=BOT_TOKEN,                        # secret path
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",  # full URL sent to Telegram
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # ── Local development (Windows / no public URL) ──────────────────
-        logger.info("No WEBHOOK_URL set — falling back to long polling (local dev mode)")
+        logger.info("No WEBHOOK_URL — falling back to polling (local dev mode)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
