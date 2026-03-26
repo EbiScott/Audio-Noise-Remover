@@ -28,7 +28,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # WEBHOOK_URL  : your full Render URL e.g. https://your-bot.onrender.com
 # PORT         : Render sets this automatically (default 8443)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-PORT = int(os.environ.get("PORT", 8443))
+PORT = int(os.environ.get("PORT") or 8443)
 
 # Store pending audio files per user: user_id -> temp_file_path
 pending_audio: dict[int, str] = {}
