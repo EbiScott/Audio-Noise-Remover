@@ -22,4 +22,3 @@ COPY . .
 
 CMD ["python", "bot.py"]       
 # Command Render runs to start your bot
-```
