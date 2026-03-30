@@ -190,8 +190,12 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     method_label = "⚡ Fast" if method == "method_fast" else "🧠 AI High Quality"
+    ai_warning = (
+        "\n\n⚠️ *AI mode can take 5–15 minutes on this server.* Please be patient and don't resend the file."
+        if method == "method_ai" else ""
+    )
     await query.edit_message_text(
-        f"🔄 Processing with *{method_label}* method... Please wait.",
+        f"🔄 Processing with *{method_label}* method... Please wait.{ai_warning}",
         parse_mode="Markdown",
     )
 
@@ -206,6 +210,13 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             await asyncio.get_event_loop().run_in_executor(
                 None, clean_audio_ai, input_path, output_path
             )
+
+        logger.info(f"Processing done. Output exists: {os.path.exists(output_path)}, size: {os.path.getsize(output_path) if os.path.exists(output_path) else 0} bytes")
+        await query.edit_message_text("✅ Processing done! Sending audio...", parse_mode="Markdown")
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            await query.edit_message_text("❌ Processing produced an empty file. Please try again.")
+            return
 
         with open(output_path, "rb") as f:
             await context.bot.send_audio(
@@ -223,7 +234,7 @@ async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logger.error(f"Processing error: {e}", exc_info=True)
-        await query.edit_message_text(f"❌ Processing failed. Error: `{e}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Processing failed. Error: <code>{e}</code>", parse_mode="HTML")
 
     finally:
         for path in [input_path, output_path]:
