@@ -164,9 +164,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text("❌ Download failed. Make sure the file is shared as 'Anyone with the link'.")
             return
 
-        size_mb = os.path.getsize(tmp.name) / 1024 / 1024
+        # Detect real format and rename so ffmpeg can identify it
+        import subprocess
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", tmp.name],
+            capture_output=True, text=True
+        )
+        fmt = probe.stdout.strip().split(",")[0]
+        ext_map = {"mp3": ".mp3", "m4a": ".m4a", "aac": ".m4a", "ogg": ".ogg",
+                   "wav": ".wav", "flac": ".flac", "mov,mp4,m4a,3gp,3g2,mj2": ".m4a"}
+        ext = ext_map.get(fmt, ".m4a")
+        renamed = tmp.name + ext
+        os.rename(tmp.name, renamed)
+        logger.info(f"Detected format: {fmt}, renamed to {renamed}")
+
+        size_mb = os.path.getsize(renamed) / 1024 / 1024
         await message.reply_text(f"✅ Downloaded ({size_mb:.1f}MB). Now choose your cleaning method:")
-        await ask_method(message, user_id, tmp.name)
+        await ask_method(message, user_id, renamed)
 
     except Exception as e:
         logger.error(f"Google Drive download error: {e}", exc_info=True)
